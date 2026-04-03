@@ -11,6 +11,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -46,20 +49,33 @@ class MainActivity : ComponentActivity() {
                 val pairingState by vm.pairingState.collectAsState()
                 val discoveredDevices by vm.discoveredDevices.collectAsState()
 
+                var lastNavigatedRoute by remember { mutableStateOf(startDest) }
+
                 LaunchedEffect(pairingState) {
-                    when (pairingState) {
-                        is PairingState.AwaitingPair -> navController.navigate("pairing") {
-                            popUpTo("scan")
+                    val targetRoute = when (pairingState) {
+                        is PairingState.AwaitingPair -> "pairing"
+                        is PairingState.PairedConnected -> "connected"
+                        is PairingState.Error -> "scan"
+                        else -> null
+                    }
+                    if (targetRoute != null && targetRoute != lastNavigatedRoute) {
+                        lastNavigatedRoute = targetRoute
+                        when (targetRoute) {
+                            "pairing" -> navController.navigate("pairing") {
+                                popUpTo("scan")
+                            }
+                            "connected" -> navController.navigate("connected") {
+                                popUpTo("scan") { inclusive = true }
+                            }
+                            "scan" -> {
+                                val current = navController.currentDestination?.route
+                                if (current == "connected" || current == "pairing") {
+                                    navController.navigate("scan") {
+                                        popUpTo(0) { inclusive = true }
+                                    }
+                                }
+                            }
                         }
-                        is PairingState.PairedConnected -> navController.navigate("connected") {
-                            popUpTo("scan") { inclusive = true }
-                        }
-                        is PairingState.Idle,
-                        is PairingState.Scanning,
-                        is PairingState.Error -> navController.navigate("scan") {
-                            popUpTo(0) { inclusive = true }
-                        }
-                        else -> Unit
                     }
                 }
 
