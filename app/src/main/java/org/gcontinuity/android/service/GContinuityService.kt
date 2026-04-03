@@ -13,8 +13,10 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.gcontinuity.android.MainActivity
 import org.gcontinuity.android.identity.DeviceIdentity
 import org.gcontinuity.android.identity.IdentityManager
@@ -47,7 +49,7 @@ class GContinuityService : Service() {
 
     private lateinit var identityManager: IdentityManager
     lateinit var identity: DeviceIdentity
-    private lateinit var store: DeviceStore
+    lateinit var store: DeviceStore
     private lateinit var mdns: MdnsDiscovery
     private lateinit var mdnsWatchdog: MdnsWatchdog
     private lateinit var networkWatcher: NetworkWatcher
@@ -98,6 +100,7 @@ class GContinuityService : Service() {
             deviceId = identity.deviceId,
             deviceName = identity.deviceName,
             onDeviceFound = { device ->
+                mdns.refreshTimestamp(device.deviceId)
                 discoveredDevices.update { current ->
                     (current.filterNot { it.deviceId == device.deviceId } + device)
                 }
@@ -126,6 +129,17 @@ class GContinuityService : Service() {
         }
 
         mdns.start()
+        serviceScope.launch {
+            while (true) {
+                delay(30_000)
+                val staleIds = mdns.getStaleDeviceIds(60_000)
+                if (staleIds.isNotEmpty()) {
+                    discoveredDevices.update { current ->
+                        current.filterNot { it.deviceId in staleIds }
+                    }
+                }
+            }
+        }
         mdnsWatchdog.start()
         pairingState.value = PairingState.Scanning
         updateNotification("Scanning...")
@@ -211,5 +225,12 @@ class GContinuityService : Service() {
         is PairingState.Scanning -> "Scanning..."
         is PairingState.Error -> "Error: ${state.message}"
         else -> "Idle"
+    }
+
+    fun triggerRefresh() {
+        discoveredDevices.value = emptyList()
+        serviceScope.launch {
+            mdns.clearAndRescan()
+        }
     }
 }

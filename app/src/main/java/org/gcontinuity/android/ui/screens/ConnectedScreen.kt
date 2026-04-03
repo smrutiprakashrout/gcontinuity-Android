@@ -13,6 +13,7 @@ import androidx.compose.material.icons.rounded.Assignment
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.LinkOff
 import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -40,11 +41,22 @@ import org.gcontinuity.android.ui.components.StatusIndicator
 fun ConnectedScreen(
     device: DeviceInfo,
     pairingState: PairingState,
-    onDisconnect: () -> Unit
+    onDisconnect: () -> Unit,
+    onOpenSettings: () -> Unit
 ) {
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("Connected") })
+            TopAppBar(
+                title = { Text("Connected") },
+                actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(
+                            imageVector = Icons.Rounded.Settings,
+                            contentDescription = "Settings"
+                        )
+                    }
+                }
+            )
         }
     ) { innerPadding ->
         Column(

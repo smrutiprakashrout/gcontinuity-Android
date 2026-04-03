@@ -1,5 +1,6 @@
 package org.gcontinuity.android.ui.components
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ChevronRight
@@ -16,10 +17,16 @@ import androidx.compose.ui.unit.dp
 import org.gcontinuity.android.network.DeviceInfo
 
 @Composable
-fun DeviceCard(device: DeviceInfo, onClick: () -> Unit) {
+fun DeviceCard(device: DeviceInfo, onClick: (() -> Unit)?) {
     ElevatedCard(
-        onClick = onClick,
         modifier = Modifier
+            .then(
+                if (onClick != null) {
+                    Modifier.clickable { onClick() }
+                } else {
+                    Modifier
+                }
+            )
     ) {
         ListItem(
             headlineContent = {

@@ -20,6 +20,7 @@ import org.gcontinuity.android.service.GContinuityService
 import org.gcontinuity.android.ui.screens.ConnectedScreen
 import org.gcontinuity.android.ui.screens.PairingScreen
 import org.gcontinuity.android.ui.screens.ScanScreen
+import org.gcontinuity.android.ui.screens.SettingsScreen
 import org.gcontinuity.android.ui.theme.GContinuityTheme
 import org.gcontinuity.android.viewmodel.MainViewModel
 
@@ -34,6 +35,9 @@ class MainActivity : ComponentActivity() {
         // Request battery optimization exemption on first launch
         requestBatteryExemption()
 
+        val initialState = GContinuityService.instance?.pairingState?.value
+        val startDest = if (initialState is PairingState.PairedConnected) "connected" else "scan"
+
         setContent {
             GContinuityTheme {
                 val navController = rememberNavController()
@@ -42,46 +46,28 @@ class MainActivity : ComponentActivity() {
                 val pairingState by vm.pairingState.collectAsState()
                 val discoveredDevices by vm.discoveredDevices.collectAsState()
 
-                // Navigate based on pairing state changes
                 LaunchedEffect(pairingState) {
-                    val current = navController.currentDestination?.route
                     when (pairingState) {
-                        is PairingState.PairedConnected -> {
-                            if (current != "connected") {
-                                navController.navigate("connected") {
-                                    popUpTo("scan") { inclusive = false }
-                                }
-                            }
+                        is PairingState.AwaitingPair -> navController.navigate("pairing") {
+                            popUpTo("scan")
                         }
-                        is PairingState.AwaitingPair -> {
-                            if (current != "pairing") {
-                                navController.navigate("pairing") {
-                                    popUpTo("scan") { inclusive = false }
-                                }
-                            }
+                        is PairingState.PairedConnected -> navController.navigate("connected") {
+                            popUpTo("scan") { inclusive = true }
                         }
                         is PairingState.Idle,
                         is PairingState.Scanning,
-                        is PairingState.Discovered,
-                        is PairingState.Error -> {
-                            if (current != "scan") {
-                                navController.navigate("scan") {
-                                    popUpTo("scan") { inclusive = true }
-                                }
-                            }
+                        is PairingState.Error -> navController.navigate("scan") {
+                            popUpTo(0) { inclusive = true }
                         }
                         else -> Unit
                     }
                 }
 
-                NavHost(navController = navController, startDestination = "scan") {
+                NavHost(navController = navController, startDestination = startDest) {
                     composable("scan") {
                         ScanScreen(
-                            discoveredDevices = discoveredDevices,
-                            pairingState = pairingState,
-                            onDeviceClick = { device ->
-                                vm.connectToDevice(device)
-                            }
+                            viewModel = vm,
+                            navController = navController
                         )
                     }
                     composable("pairing") {
@@ -97,19 +83,19 @@ class MainActivity : ComponentActivity() {
                     }
                     composable("connected") {
                         val state = pairingState
-                        val device = when (state) {
-                            is PairingState.PairedConnected -> state.device
-                            is PairingState.Reconnecting -> {
-                                // Keep the last known device visible
-                                (vm.discoveredDevices.value.firstOrNull())
-                                    ?: return@composable
-                            }
-                            else -> return@composable
+                        if (state is PairingState.PairedConnected) {
+                            ConnectedScreen(
+                                device = state.device,
+                                pairingState = state,
+                                onDisconnect = { vm.disconnect() },
+                                onOpenSettings = { navController.navigate("settings") }
+                            )
                         }
-                        ConnectedScreen(
-                            device = device,
-                            pairingState = pairingState,
-                            onDisconnect = { vm.disconnect() }
+                    }
+                    composable("settings") {
+                        SettingsScreen(
+                            viewModel = vm,
+                            onBack = { navController.popBackStack() }
                         )
                     }
                 }

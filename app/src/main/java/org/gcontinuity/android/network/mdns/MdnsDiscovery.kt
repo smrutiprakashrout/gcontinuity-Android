@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.gcontinuity.android.network.DeviceInfo
+import java.util.concurrent.ConcurrentHashMap
 
 class MdnsDiscovery(
     private val context: Context,
@@ -25,6 +26,23 @@ class MdnsDiscovery(
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
     var lastEventTimeMs = System.currentTimeMillis()
+    private val discoveryTimestamps = ConcurrentHashMap<String, Long>()
+
+    fun refreshTimestamp(deviceId: String) {
+        discoveryTimestamps[deviceId] = System.currentTimeMillis()
+    }
+
+    fun getStaleDeviceIds(ttlMs: Long = 60_000L): List<String> {
+        val now = System.currentTimeMillis()
+        return discoveryTimestamps.filter { (now - it.value) > ttlMs }.keys.toList()
+    }
+
+    suspend fun clearAndRescan() {
+        discoveryTimestamps.clear()
+        stop()
+        delay(600)
+        start()
+    }
 
     fun start() {
         Log.i(TAG, "Starting mDNS discovery")
@@ -173,6 +191,7 @@ class MdnsDiscovery(
                     return
                 }
 
+                discoveryTimestamps[foundDeviceId] = System.currentTimeMillis()
                 onDeviceFound(DeviceInfo(foundDeviceId, foundDeviceName, "", host, info.port))
             }
         }
