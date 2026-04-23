@@ -1,28 +1,52 @@
 package org.gcontinuity.android.viewmodel
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.gcontinuity.android.network.DeviceInfo
+import org.gcontinuity.android.network.Packet
 import org.gcontinuity.android.pairing.PairingState
 import org.gcontinuity.android.service.GContinuityService
+import org.gcontinuity.android.store.ALL_PLUGINS
+import org.gcontinuity.android.store.PluginStore
 
-class MainViewModel : ViewModel() {
+// Changed from ViewModel → AndroidViewModel so PluginStore can get a Context
+// without needing a separate factory. Everything else is identical to before.
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    // ── Connection state ──────────────────────────────────────────────────
 
     private val _pairingState = MutableStateFlow<PairingState>(PairingState.Idle)
-    val pairingState: StateFlow<PairingState> = _pairingState
+    val pairingState: StateFlow<PairingState> = _pairingState.asStateFlow()
 
     private val _discoveredDevices = MutableStateFlow<List<DeviceInfo>>(emptyList())
-    val discoveredDevices: StateFlow<List<DeviceInfo>> = _discoveredDevices
+    val discoveredDevices: StateFlow<List<DeviceInfo>> = _discoveredDevices.asStateFlow()
 
     val trustedDevices: StateFlow<List<DeviceInfo>>
         get() = GContinuityService.instance?.let { service ->
             MutableStateFlow(service.store.listTrustedDevices())
         } ?: MutableStateFlow(emptyList())
+
+    // ── Plugin state ──────────────────────────────────────────────────────
+
+    private val pluginStore = PluginStore(application)
+
+    private val _pluginStates = MutableStateFlow(pluginStore.getAll())
+    val pluginStates: StateFlow<Map<String, Boolean>> = _pluginStates.asStateFlow()
+
+    fun setPluginEnabled(pluginId: String, enabled: Boolean) {
+        pluginStore.setEnabled(pluginId, enabled)
+        _pluginStates.value = pluginStore.getAll()
+        // TODO: when Linux daemon supports plugin toggle packets, send here
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────
 
     init {
         viewModelScope.launch {
@@ -30,14 +54,10 @@ class MainViewModel : ViewModel() {
                 val service = GContinuityService.instance
                 if (service != null) {
                     launch {
-                        service.pairingState.collect { state ->
-                            _pairingState.value = state
-                        }
+                        service.pairingState.collect { _pairingState.value = it }
                     }
                     launch {
-                        service.discoveredDevices.collect { devices ->
-                            _discoveredDevices.value = devices
-                        }
+                        service.discoveredDevices.collect { _discoveredDevices.value = it }
                     }
                     break
                 }
@@ -45,6 +65,8 @@ class MainViewModel : ViewModel() {
             }
         }
     }
+
+    // ── Actions ───────────────────────────────────────────────────────────
 
     fun unpairDevice(device: DeviceInfo) {
         GContinuityService.instance?.store?.removeTrustedDevice(device.deviceId)
@@ -75,5 +97,15 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             service.wsClient.connect(device.host, device.port)
         }
+    }
+
+    fun sendPing() {
+        GContinuityService.instance?.wsClient?.send(
+            Packet.Ping(System.currentTimeMillis())
+        )
+    }
+
+    fun ringDevice() {
+        // TODO: send Ring packet when protocol supports it
     }
 }

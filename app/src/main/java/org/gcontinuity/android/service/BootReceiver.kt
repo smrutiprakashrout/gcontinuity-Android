@@ -8,10 +8,14 @@ import android.util.Log
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED ||
-            intent.action == "android.intent.action.QUICKBOOT_POWERON"
+        val action = intent.action ?: return
+        if (action == Intent.ACTION_BOOT_COMPLETED ||
+            action == "android.intent.action.QUICKBOOT_POWERON" ||
+            // Fired before the credential-encrypted storage is unlocked.
+            // Lets us start the service as early as possible on locked devices.
+            action == "android.intent.action.LOCKED_BOOT_COMPLETED"
         ) {
-            Log.i("BootReceiver", "Boot completed — starting GContinuityService")
+            Log.i("BootReceiver", "Boot event ($action) — starting GContinuityService")
             val serviceIntent = Intent(context, GContinuityService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(serviceIntent)
