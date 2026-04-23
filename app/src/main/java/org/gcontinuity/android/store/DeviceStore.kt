@@ -36,7 +36,9 @@ class DeviceStore(private val context: Context) {
     fun getFingerprint(deviceId: String): String? {
         val raw = prefs.getString("$PEER_PREFIX$deviceId", null) ?: return null
         return try {
-            json.decodeFromString<DeviceInfo>(raw).fingerprint
+            // Normalise to lowercase so fingerprints stored by older builds
+            // (which may have been uppercase) still match correctly.
+            json.decodeFromString<DeviceInfo>(raw).fingerprint.lowercase()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to parse device info for $deviceId", e)
             null
@@ -44,9 +46,11 @@ class DeviceStore(private val context: Context) {
     }
 
     fun storeTrustedDevice(device: DeviceInfo) {
-        val value = json.encodeToString(device)
-        prefs.edit().putString("$PEER_PREFIX${device.deviceId}", value).apply()
-        Log.i(TAG, "Stored trusted device: ${device.name} (${device.deviceId})")
+        // Always persist fingerprints in lowercase so reads are always consistent.
+        val normalised = device.copy(fingerprint = device.fingerprint.lowercase())
+        val value = json.encodeToString(normalised)
+        prefs.edit().putString("$PEER_PREFIX${normalised.deviceId}", value).apply()
+        Log.i(TAG, "Stored trusted device: ${normalised.name} (${normalised.deviceId})")
     }
 
     fun removeTrustedDevice(deviceId: String) {
@@ -59,7 +63,9 @@ class DeviceStore(private val context: Context) {
             .filterKeys { it.startsWith(PEER_PREFIX) }
             .mapNotNull { (key, value) ->
                 try {
-                    json.decodeFromString<DeviceInfo>(value as String)
+                    val device = json.decodeFromString<DeviceInfo>(value as String)
+                    // Normalise fingerprint on read for any legacy entries.
+                    device.copy(fingerprint = device.fingerprint.lowercase())
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to parse device at key $key", e)
                     null
