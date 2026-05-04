@@ -1,25 +1,18 @@
 package org.gcontinuity.android.service
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
-import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.lifecycleScope
+import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import org.gcontinuity.android.MainActivity
 import org.gcontinuity.android.identity.DeviceIdentity
 import org.gcontinuity.android.identity.IdentityManager
 import org.gcontinuity.android.network.DeviceInfo
@@ -32,23 +25,43 @@ import org.gcontinuity.android.network.ws.WsClient
 import org.gcontinuity.android.pairing.PairingManager
 import org.gcontinuity.android.pairing.PairingState
 import org.gcontinuity.android.store.DeviceStore
+import org.gcontinuity.android.transport.TransportManager
+import org.gcontinuity.android.transport.model.ConnectionState
+import org.gcontinuity.android.transport.tls.hexColonToByteArray
+import javax.inject.Inject
+import kotlinx.coroutines.flow.MutableStateFlow
 
-class GContinuityService : Service() {
+private const val TAG = "GContinuityService"
+private const val WAKELOCK_TAG = "gcontinuity:service"
 
-    companion object {
-        const val NOTIF_CHANNEL_ID = "gcontinuity_service"
-        const val NOTIF_ID = 1001
-        const val ACTION_DISCONNECT = "org.gcontinuity.DISCONNECT"
-        const val ACTION_ACCEPT_PAIRING = "org.gcontinuity.ACCEPT_PAIRING"
-        const val ACTION_REJECT_PAIRING = "org.gcontinuity.REJECT_PAIRING"
-        private const val TAG = "GContinuityService"
-        private const val WAKELOCK_TAG = "gcontinuity:service"
+/**
+ * Foreground service that owns both the pairing/mDNS layer (Phase 1) and the
+ * transport layer (Phase 2).
+ *
+ * **Pairing layer** (manually constructed, pre-Hilt):
+ * - [IdentityManager] — device TLS identity
+ * - [DeviceStore] — trusted device fingerprint storage
+ * - [WsClient] + [PairingManager] — HELLO/PAIR handshake
+ * - [MdnsDiscovery] — mDNS scanner
+ * - [ReconnectManager] — reconnect scheduler for the pairing channel
+ * - [NetworkWatcher] — WiFi loss/restore callback
+ *
+ * **Transport layer** (Hilt-injected, Phase 2):
+ * - [TransportManager] — TLS WebSocket post-pairing session
+ * - [NotificationHelper] — injectable notification builder
+ *
+ * When mDNS discovers a device that is already trusted (Phase 1 pairing complete),
+ * [TransportManager.connect] is called so the Phase 2 session begins automatically.
+ */
+@AndroidEntryPoint
+class GContinuityService : LifecycleService() {
 
-        var instance: GContinuityService? = null
-            private set
-    }
+    // ── Hilt-injected (Phase 2) ───────────────────────────────────────────────
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Inject lateinit var transportManager: TransportManager
+    @Inject lateinit var notificationHelper: NotificationHelper
+
+    // ── Manually constructed (Phase 1 — pre-Hilt) ────────────────────────────
 
     private lateinit var identityManager: IdentityManager
     lateinit var identity: DeviceIdentity
@@ -62,122 +75,158 @@ class GContinuityService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // Remember the last connected device so Reconnecting state can carry it.
-    // This lets MainActivity show/hide the ConnectedScreen correctly during
-    // a brief reconnect without a white flash.
+    /** Last device for which pairing completed, retained across reconnects for the UI. */
     private var lastConnectedDevice: DeviceInfo? = null
 
-    val pairingState = MutableStateFlow<PairingState>(PairingState.Idle)
+    val pairingState    = MutableStateFlow<PairingState>(PairingState.Idle)
     val discoveredDevices = MutableStateFlow<List<DeviceInfo>>(emptyList())
+
+    companion object {
+        const val ACTION_DISCONNECT     = "org.gcontinuity.ACTION_DISCONNECT"
+        const val ACTION_ACCEPT_PAIRING = "org.gcontinuity.ACCEPT_PAIRING"
+        const val ACTION_REJECT_PAIRING = "org.gcontinuity.REJECT_PAIRING"
+
+        /** Non-null while the service is running; null otherwise. */
+        var instance: GContinuityService? = null
+            private set
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         Log.i(TAG, "Service created")
 
-        createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("Starting…"))
+        notificationHelper.createChannel(this)
+        startForeground(
+            NotificationHelper.NOTIFICATION_ID,
+            notificationHelper.buildNotification(this, "Starting…"),
+        )
         acquireWakeLock()
 
+        // ── Phase 1 manual construction ───────────────────────────────────────
         identityManager = IdentityManager(this)
-        identity = identityManager.loadOrCreate(deviceName = Build.MODEL)
-        store = DeviceStore(this)
+        identity        = identityManager.loadOrCreate(deviceName = Build.MODEL)
+        store           = DeviceStore(this)
 
         wsClient = WsClient(
-            scope = serviceScope,
-            store = store,
-            identity = identity,
+            scope            = lifecycleScope,
+            store            = store,
+            identity         = identity,
             onPacketReceived = { packet -> pairingManager.handlePacket(packet) },
-            onConnected = {
-                updateNotification(stateToNotifText(pairingState.value))
-            },
-            onDisconnected = {
-                // Carry the last known device into Reconnecting so the UI still
-                // has a device to display during reconnect attempts.
+            onConnected      = { notificationHelper.postUpdate(this, stateToText(pairingState.value)) },
+            onDisconnected   = {
                 val device = lastConnectedDevice
                 if (device != null) {
                     pairingState.value = PairingState.Reconnecting(device)
-                    updateNotification("Reconnecting…")
+                    notificationHelper.postUpdate(this, "Reconnecting…")
                 } else {
                     pairingState.value = PairingState.Scanning
-                    updateNotification("Scanning…")
+                    notificationHelper.postUpdate(this, "Scanning…")
                 }
-            }
+            },
         )
 
         pairingManager = PairingManager(
-            identity = identity,
-            store = store,
-            wsClient = wsClient,
+            identity    = identity,
+            store       = store,
+            wsClient    = wsClient,
             onStateChange = { state ->
-                // Keep lastConnectedDevice up to date whenever we reach a
-                // fully connected state.
                 if (state is PairingState.PairedConnected) {
                     lastConnectedDevice = state.device
                 }
                 pairingState.value = state
-                updateNotification(stateToNotifText(state))
-            }
+                notificationHelper.postUpdate(this, stateToText(state))
+            },
         )
 
         mdns = MdnsDiscovery(
-            context = this,
-            scope = serviceScope,
-            deviceId = identity.deviceId,
+            context    = this,
+            scope      = lifecycleScope,
+            deviceId   = identity.deviceId,
             deviceName = identity.deviceName,
             onDeviceFound = { device ->
                 mdns.refreshTimestamp(device.deviceId)
                 discoveredDevices.update { current ->
-                    (current.filterNot { it.deviceId == device.deviceId } + device)
+                    current.filterNot { it.deviceId == device.deviceId } + device
                 }
                 reconnectManager.onDeviceDiscovered(device)
+
+                // Phase 2: start TransportManager when a trusted device appears on LAN
+                if (store.isTrusted(device.deviceId)) {
+                    val fp = store.getFingerprint(device.deviceId)
+                    if (fp != null && device.host.isNotEmpty()) {
+                        val certBytes = fp.hexColonToByteArray()
+                        transportManager.connect(
+                            scope      = lifecycleScope,
+                            host       = device.host,
+                            port       = device.port,
+                            certSha256 = certBytes,
+                        )
+                    }
+                }
             },
             onDeviceLost = { deviceId ->
                 discoveredDevices.update { it.filterNot { d -> d.deviceId == deviceId } }
-            }
+            },
         )
 
         reconnectManager = ReconnectManager(
-            scope = serviceScope,
-            store = store,
+            scope    = lifecycleScope,
+            store    = store,
             wsClient = wsClient,
-            mdns = mdns
+            mdns     = mdns,
         )
 
-        mdnsWatchdog = MdnsWatchdog(serviceScope, mdns)
-
+        mdnsWatchdog   = MdnsWatchdog(lifecycleScope, mdns)
         networkWatcher = NetworkWatcher(this)
         networkWatcher.register { event ->
             when (event) {
                 is NetworkEvent.WiFiAvailable -> reconnectManager.onNetworkRestored()
-                is NetworkEvent.WiFiLost -> reconnectManager.onNetworkLost()
+                is NetworkEvent.WiFiLost      -> reconnectManager.onNetworkLost()
             }
         }
 
         mdns.start()
+        mdnsWatchdog.start()
+        pairingState.value = PairingState.Scanning
+        notificationHelper.postUpdate(this, "Scanning…")
 
-        serviceScope.launch {
+        // Stale-device cleanup every 30 s
+        lifecycleScope.launch {
             while (true) {
-                delay(30_000)
-                val staleIds = mdns.getStaleDeviceIds(60_000)
-                if (staleIds.isNotEmpty()) {
-                    discoveredDevices.update { current ->
-                        current.filterNot { it.deviceId in staleIds }
-                    }
+                kotlinx.coroutines.delay(30_000)
+                val stale = mdns.getStaleDeviceIds(60_000)
+                if (stale.isNotEmpty()) {
+                    discoveredDevices.update { it.filterNot { d -> d.deviceId in stale } }
                 }
             }
         }
 
-        mdnsWatchdog.start()
-        pairingState.value = PairingState.Scanning
-        updateNotification("Scanning…")
+        // Update notification when Phase 2 transport state changes
+        transportManager.connectionState
+            .onEach { state ->
+                val text = when (state) {
+                    ConnectionState.CONNECTED    ->
+                        "Connected to ${transportManager.connectedDeviceName.value ?: "Linux"}"
+                    ConnectionState.RECONNECTING -> "Reconnecting…"
+                    ConnectionState.CONNECTING   -> "Connecting…"
+                    ConnectionState.DISCONNECTED -> stateToText(pairingState.value)
+                }
+                notificationHelper.postUpdate(this, text)
+            }
+            .launchIn(lifecycleScope)
+
         Log.i(TAG, "Service initialized. Device ID: ${identity.deviceId}")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_DISCONNECT -> {
-                lastConnectedDevice = null   // user-initiated — clear remembered device
+                lastConnectedDevice = null
+                transportManager.stop()
                 wsClient.disconnect()
             }
             ACTION_ACCEPT_PAIRING -> {
@@ -194,11 +243,11 @@ class GContinuityService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         Log.i(TAG, "Task removed — scheduling restart")
-        val restartIntent = Intent(applicationContext, GContinuityService::class.java)
+        val restart = Intent(applicationContext, GContinuityService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            applicationContext.startForegroundService(restartIntent)
+            applicationContext.startForegroundService(restart)
         } else {
-            applicationContext.startService(restartIntent)
+            applicationContext.startService(restart)
         }
     }
 
@@ -209,71 +258,17 @@ class GContinuityService : Service() {
         networkWatcher.unregister()
         reconnectManager.cancelReconnect()
         wsClient.disconnect("service_stopping")
+        transportManager.stop()
         releaseWakeLock()
-        serviceScope.coroutineContext[Job]?.cancel()
         Log.i(TAG, "Service destroyed")
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent): IBinder? = super.onBind(intent)
 
-    // ── Notification ──────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIF_CHANNEL_ID,
-                "GContinuity",
-                NotificationManager.IMPORTANCE_MIN
-            ).apply {
-                description = "Device connection status"
-                setShowBadge(false)
-                enableLights(false)
-                enableVibration(false)
-                setSound(null, null)
-            }
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(text: String): Notification {
-        val mainIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val contentIntent = PendingIntent.getActivity(
-            this, 0, mainIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val disconnectIntent = Intent(this, GContinuityService::class.java).apply {
-            action = ACTION_DISCONNECT
-        }
-        val disconnectPending = PendingIntent.getService(
-            this, 1, disconnectIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setContentTitle("GContinuity")
-            .setContentText(text)
-            .setOngoing(true)
-            .setSilent(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setContentIntent(contentIntent)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Disconnect",
-                disconnectPending
-            )
-            .build()
-    }
-
-    fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
-    }
-
-    private fun stateToNotifText(state: PairingState): String = when (state) {
+    private fun stateToText(state: PairingState): String = when (state) {
         is PairingState.PairedConnected -> "Connected to ${state.device.name}"
         is PairingState.AwaitingPair    -> "Pairing with ${state.device.name}…"
         is PairingState.Reconnecting    -> "Reconnecting to ${state.device.name}…"
@@ -281,8 +276,6 @@ class GContinuityService : Service() {
         is PairingState.Error           -> "Error: ${state.message}"
         else                            -> "Idle"
     }
-
-    // ── Wakelock ──────────────────────────────────────────────────────────
 
     private fun acquireWakeLock() {
         val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -300,6 +293,6 @@ class GContinuityService : Service() {
 
     fun triggerRefresh() {
         discoveredDevices.value = emptyList()
-        serviceScope.launch { mdns.clearAndRescan() }
+        lifecycleScope.launch { mdns.clearAndRescan() }
     }
 }

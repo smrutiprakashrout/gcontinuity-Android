@@ -1,3 +1,18 @@
+// org/gcontinuity/android/pairing/PairingManager.kt
+//
+// CHANGES FROM OLD VERSION:
+//   1. `Packet.Hello` match no longer reads `fingerprint` — field removed.
+//      On receiving Linux's Hello, Android now waits for PairAccept/PairReject
+//      (which it receives in response to the PairRequest sent by WsClient).
+//   2. `Packet.Ping { timestamp_ms }` → `Packet.Ping` (bare object).
+//      `wsClient.send(Packet.Pong(packet.timestamp_ms))` →
+//      `wsClient.send(Packet.Pong)` (bare object).
+//   3. `Packet.Pong` match no longer destructures timestamp_ms.
+//   4. `Packet.Disconnect { reason }` → `Packet.Disconnect` (bare object).
+//   5. `Packet.PairReject` still has `reason` field — unchanged.
+//   6. `Packet.PairRequest` received from Linux is logged and ignored on the
+//      Android side (Linux never sends PairRequest to Android in Phase 1).
+
 package org.gcontinuity.android.pairing
 
 import android.util.Log
@@ -8,6 +23,18 @@ import org.gcontinuity.android.network.toJson
 import org.gcontinuity.android.network.ws.WsClient
 import org.gcontinuity.android.store.DeviceStore
 
+/**
+ * Manages the Phase 1 pairing state machine on the Android side.
+ *
+ * State transitions:
+ * ```
+ * Idle
+ *  └─ onOpen  → WsClient sends Hello + PairRequest
+ *      └─ recv PairAccept → PairedConnected (known device: auto-trust)
+ *      └─ recv PairAccept → AwaitingPair → user taps Accept → PairedConnected
+ *      └─ recv PairReject → Error
+ * ```
+ */
 class PairingManager(
     private val identity: DeviceIdentity,
     private val store: DeviceStore,
@@ -16,6 +43,8 @@ class PairingManager(
 ) {
     private val TAG = "PairingManager"
     private var currentState: PairingState = PairingState.Idle
+    /** The DeviceInfo received from Linux's Hello — populated in onHello(). */
+    private var linuxDevice: DeviceInfo? = null
 
     fun getCurrentState(): PairingState = currentState
 
@@ -26,21 +55,48 @@ class PairingManager(
 
     fun handlePacket(packet: Packet) {
         when (packet) {
+            // ── Linux's Hello reply ──────────────────────────────────────────
+            // Hello no longer carries fingerprint.
+            // Android just records Linux's identity; fingerprint comes later
+            // in PairAccept.
             is Packet.Hello -> {
-                val stored = store.getFingerprint(packet.device_id)
+                Log.i(TAG, "Linux Hello received from ${packet.name} (${packet.device_id})")
+                linuxDevice = DeviceInfo(
+                    deviceId    = packet.device_id,
+                    name        = packet.name,
+                    fingerprint = "",  // will be set from PairAccept
+                )
+                // WsClient already sent PairRequest in onOpen — nothing more to do here.
+            }
+
+            // ── Linux accepts pairing ────────────────────────────────────────
+            is Packet.PairAccept -> {
+                val device = linuxDevice ?: run {
+                    Log.e(TAG, "PairAccept received but no linuxDevice recorded")
+                    return
+                }
+                val updatedDevice = device.copy(fingerprint = packet.fingerprint)
+
+                val stored = store.getFingerprint(device.deviceId)
                 when {
                     stored == null -> {
-                        Log.i(TAG, "Unknown device ${packet.name} — showing pairing UI")
-                        val device = DeviceInfo(packet.device_id, packet.name, packet.fingerprint)
-                        setState(PairingState.AwaitingPair(device, linuxFingerprint = packet.fingerprint))
+                        // First time — show pairing UI for user to verify fingerprint.
+                        Log.i(TAG, "New device ${device.name} — showing pairing UI")
+                        setState(
+                            PairingState.AwaitingPair(
+                                device           = updatedDevice,
+                                linuxFingerprint = packet.fingerprint,
+                            )
+                        )
                     }
                     stored == packet.fingerprint -> {
-                        Log.i(TAG, "Auto-trusted: ${packet.name}")
-                        val device = DeviceInfo(packet.device_id, packet.name, packet.fingerprint)
-                        setState(PairingState.PairedConnected(device))
+                        // Known device and fingerprint matches — auto-trust.
+                        Log.i(TAG, "Auto-trusted: ${device.name}")
+                        store.storeTrustedDevice(updatedDevice)
+                        setState(PairingState.PairedConnected(updatedDevice))
                     }
                     else -> {
-                        Log.e(TAG, "FINGERPRINT MISMATCH for ${packet.name} — possible MITM!")
+                        Log.e(TAG, "FINGERPRINT MISMATCH for ${device.name} — possible MITM!")
                         wsClient.send(Packet.PairReject("fingerprint_changed"))
                         wsClient.disconnect("fingerprint_changed")
                         setState(PairingState.Error("Security warning: device fingerprint changed"))
@@ -48,54 +104,54 @@ class PairingManager(
                 }
             }
 
-            is Packet.PairAccept -> {
-                val state = currentState
-                if (state is PairingState.AwaitingPair) {
-                    store.storeTrustedDevice(
-                        DeviceInfo(
-                            deviceId = state.device.deviceId,
-                            name = state.device.name,
-                            fingerprint = packet.fingerprint
-                        )
-                    )
-                    setState(PairingState.PairedConnected(state.device))
-                    Log.i(TAG, "Pairing accepted by Linux for ${state.device.name}")
-                }
-            }
-
+            // ── Linux rejects pairing ────────────────────────────────────────
             is Packet.PairReject -> {
-                Log.w(TAG, "Pairing rejected: ${packet.reason}")
+                Log.w(TAG, "Pairing rejected by Linux: ${packet.reason}")
                 setState(PairingState.Error("Pairing rejected: ${packet.reason}"))
                 wsClient.disconnect(packet.reason)
             }
 
-            is Packet.Ping -> {
-                wsClient.send(Packet.Pong(packet.timestamp_ms))
-                Log.d(TAG, "Ping → Pong (${packet.timestamp_ms})")
+            // ── Linux sends a PairRequest (should not happen in normal flow) ─
+            is Packet.PairRequest -> {
+                Log.d(TAG, "PairRequest received from Linux (unexpected in client role) — ignored")
             }
 
+            // ── Keepalive — Ping is now bare (no timestamp_ms) ────────────────
+            is Packet.Ping -> {
+                wsClient.send(Packet.Pong)
+                Log.d(TAG, "Ping → Pong")
+            }
+
+            // ── Pong is bare — no fields to destructure ──────────────────────
             is Packet.Pong -> {
                 Log.d(TAG, "Pong received")
             }
 
+            // ── Disconnect is bare — no reason field ─────────────────────────
             is Packet.Disconnect -> {
-                Log.i(TAG, "Disconnect from remote: ${packet.reason}")
+                Log.i(TAG, "Disconnect received from Linux")
                 setState(PairingState.Idle)
-            }
-
-            is Packet.PairRequest -> {
-                Log.d(TAG, "PairRequest received (handled by daemon side)")
             }
         }
     }
 
+    // ── UI-triggered actions ──────────────────────────────────────────────────
+
+    /**
+     * Called when the Android user taps "Trust" in the pairing dialog.
+     * Stores the device and notifies the feature layer.
+     */
     fun acceptPairing(device: DeviceInfo) {
         store.storeTrustedDevice(device)
-        wsClient.send(Packet.PairAccept(identity.fingerprint))
+        // Android does NOT send PairAccept back — Linux already sent PairAccept
+        // to Android, so the handshake is complete.  Just update local state.
         setState(PairingState.PairedConnected(device))
-        Log.i(TAG, "Pairing accepted for ${device.name}")
+        Log.i(TAG, "Pairing accepted locally for ${device.name}")
     }
 
+    /**
+     * Called when the Android user taps "Reject" in the pairing dialog.
+     */
     fun rejectPairing() {
         wsClient.send(Packet.PairReject("user_rejected"))
         wsClient.disconnect("user_rejected")

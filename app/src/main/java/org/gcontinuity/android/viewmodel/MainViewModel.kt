@@ -16,11 +16,7 @@ import org.gcontinuity.android.service.GContinuityService
 import org.gcontinuity.android.store.ALL_PLUGINS
 import org.gcontinuity.android.store.PluginStore
 
-// Changed from ViewModel → AndroidViewModel so PluginStore can get a Context
-// without needing a separate factory. Everything else is identical to before.
 class MainViewModel(application: Application) : AndroidViewModel(application) {
-
-    // ── Connection state ──────────────────────────────────────────────────
 
     private val _pairingState = MutableStateFlow<PairingState>(PairingState.Idle)
     val pairingState: StateFlow<PairingState> = _pairingState.asStateFlow()
@@ -33,8 +29,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             MutableStateFlow(service.store.listTrustedDevices())
         } ?: MutableStateFlow(emptyList())
 
-    // ── Plugin state ──────────────────────────────────────────────────────
-
     private val pluginStore = PluginStore(application)
 
     private val _pluginStates = MutableStateFlow(pluginStore.getAll())
@@ -43,30 +37,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setPluginEnabled(pluginId: String, enabled: Boolean) {
         pluginStore.setEnabled(pluginId, enabled)
         _pluginStates.value = pluginStore.getAll()
-        // TODO: when Linux daemon supports plugin toggle packets, send here
     }
-
-    // ── Init ──────────────────────────────────────────────────────────────
 
     init {
         viewModelScope.launch {
             while (true) {
                 val service = GContinuityService.instance
                 if (service != null) {
-                    launch {
-                        service.pairingState.collect { _pairingState.value = it }
-                    }
-                    launch {
-                        service.discoveredDevices.collect { _discoveredDevices.value = it }
-                    }
+                    launch { service.pairingState.collect { _pairingState.value = it } }
+                    launch { service.discoveredDevices.collect { _discoveredDevices.value = it } }
                     break
                 }
                 delay(200)
             }
         }
     }
-
-    // ── Actions ───────────────────────────────────────────────────────────
 
     fun unpairDevice(device: DeviceInfo) {
         GContinuityService.instance?.store?.removeTrustedDevice(device.deviceId)
@@ -100,9 +85,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendPing() {
-        GContinuityService.instance?.wsClient?.send(
-            Packet.Ping(System.currentTimeMillis())
-        )
+        // FIX: Packet.Ping is a bare object — no timestamp_ms argument.
+        GContinuityService.instance?.wsClient?.send(Packet.Ping)
     }
 
     fun ringDevice() {

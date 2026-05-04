@@ -15,12 +15,22 @@ object TlsHelper {
 
     /**
      * Compute SHA-256 fingerprint of the certificate's DER encoding.
-     * Always returns lowercase hex separated by colons, e.g. "af:50:06:4d:..."
-     * This matches the format produced by openssl / rustls on the Linux side.
+     *
+     * FIX: Changed from colon-separated ("af:50:06:4d:...") to plain hex
+     * ("af50064d...") to match the format the Linux daemon sends in PairAccept.
+     *
+     * Root cause of TLS CertificateUnknown on reconnect:
+     *   - Daemon sends PairAccept.fingerprint as plain hex: "4c1af889..."
+     *   - DeviceStore stores it as plain hex (lowercased)
+     *   - On reconnect, TlsHelper.buildSslContext() loaded stored fingerprints
+     *     as {"4c1af889..."} but sha256Fingerprint() produced "4c:1a:f8:89:..."
+     *   - "4c:1a:f8:89:..." != "4c1af889..." → CertificateException → crash
+     *
+     * Using plain hex here means both sides always use the same format.
      */
     private fun X509Certificate.sha256Fingerprint(): String {
         val sha256 = MessageDigest.getInstance("SHA-256").digest(encoded)
-        return sha256.joinToString(":") { "%02x".format(it) }
+        return sha256.joinToString("") { "%02x".format(it) }
     }
 
     // ── Trusted-device mode ────────────────────────────────────────────────
