@@ -15,6 +15,8 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BatteryChargingFull
+import androidx.compose.material.icons.outlined.BatteryFull
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Notifications
@@ -50,6 +52,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,13 +61,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import org.gcontinuity.android.network.DeviceInfo
 import org.gcontinuity.android.pairing.PairingState
+import org.gcontinuity.android.plugins.BatteryState
 import org.gcontinuity.android.ui.components.StatusIndicator
 import org.gcontinuity.android.viewmodel.MainViewModel
 
@@ -101,6 +104,10 @@ fun ConnectedScreen(
     var showOverflowMenu by remember { mutableStateOf(false) }
     var showEncryptionDialog by remember { mutableStateOf(false) }
     var showUnpairDialog by remember { mutableStateOf(false) }
+
+    // Linux machine battery — received from daemon via LinuxBatteryInfo packet.
+    // Null until the first UPower broadcast arrives (≤ 60 s after connection).
+    val linuxBattery by viewModel.linuxBatteryState.collectAsState()
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -190,11 +197,13 @@ fun ConnectedScreen(
                     },
                     title = {
                         Column {
+                            // Line 1 — Linux device name (unchanged)
                             Text(
                                 text = device.name,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                             )
+                            // Line 2 — connection status (unchanged)
                             Text(
                                 text = if (pairingState is PairingState.Reconnecting)
                                     "Reconnecting…" else "Connected",
@@ -204,6 +213,11 @@ fun ConnectedScreen(
                                 else
                                     MaterialTheme.colorScheme.primary,
                             )
+                            // Line 3 — Linux machine battery (Phase 3).
+                            // Shows only after first LinuxBatteryInfo packet from daemon.
+                            linuxBattery?.let { battery ->
+                                LinuxBatteryRow(battery = battery)
+                            }
                         }
                     },
                     actions = {
@@ -291,7 +305,7 @@ fun ConnectedScreen(
                     }
                 }
 
-                // Feature grid
+                // Feature grid (unchanged)
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     modifier = Modifier
@@ -308,7 +322,7 @@ fun ConnectedScreen(
         }
     }
 
-    // ── Encryption info dialog ────────────────────────────────────────────
+    // ── Encryption info dialog (unchanged) ────────────────────────────────────
     if (showEncryptionDialog) {
         AlertDialog(
             onDismissRequest = { showEncryptionDialog = false },
@@ -321,7 +335,6 @@ fun ConnectedScreen(
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    // Reuse existing FingerprintDisplay component
                     org.gcontinuity.android.ui.components.FingerprintDisplay(
                         fingerprint = device.fingerprint,
                         modifier = Modifier.fillMaxWidth()
@@ -334,7 +347,7 @@ fun ConnectedScreen(
         )
     }
 
-    // ── Unpair confirmation dialog ────────────────────────────────────────
+    // ── Unpair confirmation dialog (unchanged) ────────────────────────────────
     if (showUnpairDialog) {
         AlertDialog(
             onDismissRequest = { showUnpairDialog = false },
@@ -368,7 +381,35 @@ fun ConnectedScreen(
     }
 }
 
-// ── Feature card ──────────────────────────────────────────────────────────────
+// ── Linux battery row (Phase 3) ───────────────────────────────────────────────
+
+/**
+ * Compact row shown as Line 3 in the TopAppBar title Column.
+ * Displays the Linux machine's battery received via [Packet.LinuxBatteryInfo].
+ * Only rendered when [battery] is non-null (after first daemon UPower broadcast).
+ */
+@Composable
+private fun LinuxBatteryRow(battery: BatteryState) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            imageVector = if (battery.isCharging)
+                Icons.Outlined.BatteryChargingFull
+            else
+                Icons.Outlined.BatteryFull,
+            contentDescription = if (battery.isCharging) "Charging" else "Not charging",
+            modifier = Modifier.size(12.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.width(3.dp))
+        Text(
+            text = "PC ${battery.percent}%" + if (battery.isCharging) " · Charging" else "",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+// ── Feature card (unchanged) ──────────────────────────────────────────────────
 
 @Composable
 private fun FeatureCard(feature: FeatureItem) {

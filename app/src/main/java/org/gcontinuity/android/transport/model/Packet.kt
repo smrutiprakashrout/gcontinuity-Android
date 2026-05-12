@@ -10,8 +10,9 @@ import kotlinx.serialization.json.JsonObject
  * Sealed class representing every packet type in the GContinuity protocol.
  *
  * Serialized as JSON with a "type" discriminator field. Must stay in sync with
- * the Rust [Packet] enum in gcontinuity-daemon. All discriminator values are
- * lowercase snake_case to match the Rust #[serde(rename = "...")] annotations.
+ * the Rust Packet enum in gcontinuity-daemon/src/transport/packet.rs.
+ * All discriminator values are lowercase snake_case to match Rust
+ * #[serde(tag = "type", rename_all = "snake_case")].
  */
 @OptIn(ExperimentalSerializationApi::class)
 @Serializable
@@ -20,7 +21,6 @@ sealed class Packet {
 
     // ── Handshake ─────────────────────────────────────────────────────────────
 
-    /** Initial greeting sent by both sides after TLS handshake completes. */
     @Serializable
     @SerialName("hello")
     data class Hello(
@@ -29,44 +29,58 @@ sealed class Packet {
         val version: Int,
     ) : Packet()
 
-    /** Acknowledgement that Hello was accepted. */
-    @Serializable
-    @SerialName("ack")
-    object Ack : Packet()
+    @Serializable @SerialName("ack")        object Ack        : Packet()
+    @Serializable @SerialName("ping")       object Ping       : Packet()
+    @Serializable @SerialName("pong")       object Pong       : Packet()
+    @Serializable @SerialName("disconnect") object Disconnect : Packet()
 
-    /** Keepalive ping from either side. */
-    @Serializable
-    @SerialName("ping")
-    object Ping : Packet()
-
-    /** Keepalive pong response. */
-    @Serializable
-    @SerialName("pong")
-    object Pong : Packet()
-
-    /** Graceful disconnect notification. */
-    @Serializable
-    @SerialName("disconnect")
-    object Disconnect : Packet()
-
-    /** Attempts to resume a previous session without re-pairing. */
     @Serializable
     @SerialName("session_resume")
     data class SessionResume(val session_token: String) : Packet()
 
     // ── Phase 3: Data Sync ────────────────────────────────────────────────────
 
-    /** Clipboard content push from either side. */
     @Serializable
     @SerialName("clipboard_sync")
     data class ClipboardSync(val mime: String, val data: String) : Packet()
 
-    /** Android battery status broadcast. */
+    /**
+     * Android → Linux: Android battery status.
+     *
+     * Wire: {"type":"battery_info","percent":87,"is_charging":true,"timestamp":1746532800000}
+     *
+     * Sent by [org.gcontinuity.android.plugins.BatteryPlugin] every 60 s.
+     * Received by the Linux daemon → updates D-Bus org.gcontinuity.Battery →
+     * Flutter battery_page.dart displays the Android battery level.
+     */
     @Serializable
-    @SerialName("battery_update")
-    data class BatteryUpdate(val percent: Int, val charging: Boolean) : Packet()
+    @SerialName("battery_info")
+    data class BatteryInfo(
+        val percent: Int,
+        @SerialName("is_charging") val isCharging: Boolean,
+        val timestamp: Long,
+    ) : Packet()
 
-    /** Android offers a file to the Linux daemon. */
+    /**
+     * Linux → Android: Linux machine battery status.
+     *
+     * Wire: {"type":"linux_battery_info","percent":72,"is_charging":false,"timestamp":...}
+     *
+     * Sent by the Linux daemon's UPower poll every 60 s.
+     * Received by [org.gcontinuity.android.plugins.BatteryPlugin.onPacket] →
+     * stored in [org.gcontinuity.android.plugins.BatteryPlugin.linuxBatteryState] →
+     * displayed in ConnectedScreen TopAppBar below "Connected".
+     */
+    @Serializable
+    @SerialName("linux_battery_info")
+    data class LinuxBatteryInfo(
+        val percent: Int,
+        @SerialName("is_charging") val isCharging: Boolean,
+        val timestamp: Long,
+    ) : Packet()
+
+    // ── File transfer ─────────────────────────────────────────────────────────
+
     @Serializable
     @SerialName("file_send_offer")
     data class FileSendOffer(
@@ -76,22 +90,18 @@ sealed class Packet {
         val mime: String,
     ) : Packet()
 
-    /** Linux accepts the file offer; Android begins sending chunks. */
     @Serializable
     @SerialName("file_send_accept")
     data class FileSendAccept(val file_id: String) : Packet()
 
-    /** Linux rejects the file offer. */
     @Serializable
     @SerialName("file_send_reject")
     data class FileSendReject(val file_id: String) : Packet()
 
-    /** Signals that all file chunks have been sent; includes integrity hash. */
     @Serializable
     @SerialName("file_send_eof")
     data class FileSendEof(val file_id: String, val sha256: String) : Packet()
 
-    /** Incremental progress update for an in-flight transfer. */
     @Serializable
     @SerialName("file_progress")
     data class FileProgress(
@@ -102,7 +112,6 @@ sealed class Packet {
 
     // ── Phase 4: Notifications + Media ───────────────────────────────────────
 
-    /** Forwards an Android notification to the Linux desktop. */
     @Serializable
     @SerialName("notification_post")
     data class NotificationPost(
@@ -113,17 +122,14 @@ sealed class Packet {
         val icon_b64: String? = null,
     ) : Packet()
 
-    /** Removes a previously forwarded notification. */
     @Serializable
     @SerialName("notification_dismiss")
     data class NotificationDismiss(val id: Long) : Packet()
 
-    /** User replied to a notification from the Linux side. */
     @Serializable
     @SerialName("notification_reply")
     data class NotificationReply(val id: Long, val text: String) : Packet()
 
-    /** Obsidian vault file delta for incremental sync. */
     @Serializable
     @SerialName("obsidian_file_delta")
     data class ObsidianFileDelta(
@@ -132,7 +138,6 @@ sealed class Packet {
         val data_b64: String,
     ) : Packet()
 
-    /** Current media playback state from Android media session. */
     @Serializable
     @SerialName("media_state_update")
     data class MediaStateUpdate(
@@ -144,24 +149,20 @@ sealed class Packet {
         val duration_ms: Long,
     ) : Packet()
 
-    /** Playback control command sent from the Linux desktop. */
     @Serializable
     @SerialName("media_command")
     data class MediaCommand(val action: MediaAction) : Packet()
 
     // ── Phase 5: Remote Control ───────────────────────────────────────────────
 
-    /** Raw input event (mouse/keyboard) forwarded from Linux to Android. */
     @Serializable
     @SerialName("input_event")
     data class InputEvent(val kind: InputKind, val data: JsonObject) : Packet()
 
-    /** Linux requests execution of a pre-configured command. */
     @Serializable
     @SerialName("run_command_request")
     data class RunCommandRequest(val command_id: String) : Packet()
 
-    /** Output of a completed command execution. */
     @Serializable
     @SerialName("run_command_output")
     data class RunCommandOutput(
@@ -171,41 +172,24 @@ sealed class Packet {
         val exit_code: Int,
     ) : Packet()
 
-    /** Begins screen-share streaming from Android to Linux. */
-    @Serializable
-    @SerialName("screen_share_start")
-    object ScreenShareStart : Packet()
-
-    /** Terminates screen-share streaming. */
-    @Serializable
-    @SerialName("screen_share_stop")
-    object ScreenShareStop : Packet()
+    @Serializable @SerialName("screen_share_start") object ScreenShareStart : Packet()
+    @Serializable @SerialName("screen_share_stop")  object ScreenShareStop  : Packet()
 
     // ── Phase 6: Camera-as-Webcam ─────────────────────────────────────────────
 
-    /** Begins streaming Android camera as a virtual webcam on Linux. */
-    @Serializable
-    @SerialName("webcam_start")
-    object WebcamStart : Packet()
+    @Serializable @SerialName("webcam_start") object WebcamStart : Packet()
+    @Serializable @SerialName("webcam_stop")  object WebcamStop  : Packet()
 
-    /** Stops the camera stream. */
-    @Serializable
-    @SerialName("webcam_stop")
-    object WebcamStop : Packet()
+    // ── WebRTC Signaling ──────────────────────────────────────────────────────
 
-    // ── WebRTC Signaling (used by media phases 5–6) ───────────────────────────
-
-    /** SDP offer initiating a WebRTC peer connection. */
     @Serializable
     @SerialName("webrtc_sdp_offer")
     data class WebRtcSdpOffer(val session_id: String, val sdp: String) : Packet()
 
-    /** SDP answer completing the WebRTC negotiation. */
     @Serializable
     @SerialName("webrtc_sdp_answer")
     data class WebRtcSdpAnswer(val session_id: String, val sdp: String) : Packet()
 
-    /** ICE candidate for NAT traversal within the local network. */
     @Serializable
     @SerialName("webrtc_ice_candidate")
     data class WebRtcIceCandidate(
@@ -215,13 +199,11 @@ sealed class Packet {
         val sdp_m_line_index: Int,
     ) : Packet()
 
-    /** Closes a WebRTC session and frees associated resources. */
     @Serializable
     @SerialName("webrtc_close")
     data class WebRtcClose(val session_id: String) : Packet()
 }
 
-/** Media playback actions used in [Packet.MediaCommand]. */
 @Serializable
 enum class MediaAction {
     @SerialName("play")       Play,
@@ -232,7 +214,6 @@ enum class MediaAction {
     @SerialName("volume_set") VolumeSet,
 }
 
-/** Input event kinds used in [Packet.InputEvent]. */
 @Serializable
 enum class InputKind {
     @SerialName("mouse_move")   MouseMove,

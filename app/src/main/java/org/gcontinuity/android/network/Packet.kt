@@ -1,22 +1,12 @@
 // org/gcontinuity/android/network/Packet.kt
 //
-// CHANGES FROM OLD VERSION (inferred from WsClient.kt and PairingManager.kt usage):
-//   1. Type discriminator was "SCREAMING_SNAKE_CASE" (e.g. "HELLO") →
-//      changed to snake_case (e.g. "hello") to match Linux gcontinuity-common.
-//   2. Ping/Pong no longer carry timestamp_ms — now bare objects.
-//   3. Disconnect no longer carries reason — now a bare object.
-//   4. Hello no longer carries fingerprint — fingerprint goes in PairRequest.
-//      Android sends Hello first, then PairRequest with the fingerprint.
-//   5. toJson() now uses a stable serialization that is safe to call from
-//      any thread (no shared state).
-//
-// PROTOCOL FLOW (Android initiates):
-//   Android → Linux : Hello {device_id, name, version}
-//   Linux → Android : Hello {device_id, name, version}   ← Linux's identity
-//   Android → Linux : PairRequest {device_id, name, fingerprint}
-//   Linux → Android : PairAccept {fingerprint}  OR  PairReject {reason}
-//   (subsequent keepalive)
-//   Either side     : Ping  →  Pong
+// CHANGES vs previous version:
+//   - Added FeaturePacket(type, raw) variant to the sealed class.
+//     fromJson() now returns FeaturePacket instead of null for unrecognised
+//     types (e.g. "linux_battery_info", "clipboard_sync", etc.).
+//     This allows WsClient to forward Phase 3–6 packets to the feature layer
+//     via GContinuityService.onPacketReceived, instead of silently dropping them.
+//   - All existing pairing variants are unchanged.
 
 package org.gcontinuity.android.network
 
@@ -27,53 +17,64 @@ import org.json.JSONObject
  *
  * Serialised as `{"type":"<snake_case>", ...}`.
  * Must stay in sync with `gcontinuity-common/src/packet.rs` on the Linux side.
+ *
+ * Phase 3–6 feature packets (e.g. [FeaturePacket]) are carried as raw JSON
+ * and forwarded to [org.gcontinuity.android.plugins.PluginManager] by
+ * [org.gcontinuity.android.service.GContinuityService] before they reach
+ * [org.gcontinuity.android.pairing.PairingManager].
  */
 sealed class Packet {
 
     // ── Handshake ─────────────────────────────────────────────────────────────
 
-    /** First packet sent by either side after TLS connection is established. */
     data class Hello(
         val device_id: String,
         val name: String,
         val version: Int,
     ) : Packet()
 
-    /**
-     * Sent by Android after receiving Linux's Hello, carrying the fingerprint
-     * to be verified visually by both users during the pairing ceremony.
-     */
     data class PairRequest(
         val device_id: String,
         val name: String,
         val fingerprint: String,
     ) : Packet()
 
-    /** Sent by the accepting side after the user clicks "Accept". */
     data class PairAccept(val fingerprint: String) : Packet()
-
-    /** Sent by either side to cancel or reject pairing. */
     data class PairReject(val reason: String) : Packet()
 
     // ── Keepalive ─────────────────────────────────────────────────────────────
 
-    /** Keepalive probe — no fields. */
-    object Ping : Packet()
-
-    /** Reply to Ping — no fields. */
-    object Pong : Packet()
-
-    // ── Teardown ──────────────────────────────────────────────────────────────
-
-    /** Graceful connection teardown — no fields. */
+    object Ping       : Packet()
+    object Pong       : Packet()
     object Disconnect : Packet()
 
-    // ── Serialisation ─────────────────────────────────────────────────────────
+    // ── Phase 3–6 feature packets ─────────────────────────────────────────────
+
+    /**
+     * Wrapper for any packet type that is not part of the Phase 1 pairing
+     * protocol (e.g. `linux_battery_info`, `clipboard_sync`, `notification_post`).
+     *
+     * [type] is the raw `"type"` discriminator value from the JSON.
+     * [raw]  is the full original JSON string, passed to
+     *        [org.gcontinuity.android.plugins.PluginManager.dispatchRawFeaturePacket]
+     *        for decoding via kotlinx.serialization.
+     *
+     * [PairingManager] never sees this variant — [GContinuityService] intercepts
+     * it in the `onPacketReceived` callback before forwarding to [PairingManager].
+     */
+    data class FeaturePacket(val type: String, val raw: String) : Packet()
+
+    // ── Deserialisation ───────────────────────────────────────────────────────
 
     companion object {
         /**
          * Deserialise a JSON string into a [Packet].
-         * Returns `null` for unrecognised or malformed input (forward-compatible).
+         *
+         * Known pairing types are parsed fully. Unknown types (Phase 3–6
+         * feature packets) are returned as [FeaturePacket] so the caller
+         * can forward them to the feature layer rather than dropping them.
+         *
+         * Never returns null.
          */
         fun fromJson(json: String): Packet? = runCatching {
             val obj = JSONObject(json)
@@ -93,9 +94,10 @@ sealed class Packet {
                 "ping"        -> Ping
                 "pong"        -> Pong
                 "disconnect"  -> Disconnect
-                else          -> {
-                    android.util.Log.w("Packet", "Unknown packet type: $type")
-                    null
+                // Phase 3–6 packets — forward raw JSON to feature layer.
+                else -> {
+                    android.util.Log.d("Packet", "Feature packet received: $type")
+                    FeaturePacket(type = type, raw = json)
                 }
             }
         }.getOrElse { e ->
@@ -107,7 +109,7 @@ sealed class Packet {
 
 /**
  * Serialise this [Packet] to a JSON string.
- * Uses plain [JSONObject] — no reflection, safe on all API levels.
+ * [Packet.FeaturePacket] is never serialised (it is inbound-only).
  */
 fun Packet.toJson(): String = JSONObject().apply {
     when (val p = this@toJson) {
@@ -123,16 +125,16 @@ fun Packet.toJson(): String = JSONObject().apply {
             put("name", p.name)
             put("fingerprint", p.fingerprint)
         }
-        is Packet.PairAccept -> {
-            put("type", "pair_accept")
-            put("fingerprint", p.fingerprint)
+        is Packet.PairAccept  -> { put("type", "pair_accept");  put("fingerprint", p.fingerprint) }
+        is Packet.PairReject  -> { put("type", "pair_reject");  put("reason", p.reason) }
+        Packet.Ping           -> put("type", "ping")
+        Packet.Pong           -> put("type", "pong")
+        Packet.Disconnect     -> put("type", "disconnect")
+        is Packet.FeaturePacket -> {
+            // FeaturePacket is inbound-only — should never be serialised.
+            // Return the raw JSON unchanged if somehow called.
+            android.util.Log.w("Packet", "toJson() called on FeaturePacket — returning raw")
+            throw UnsupportedOperationException("FeaturePacket is not serialisable")
         }
-        is Packet.PairReject -> {
-            put("type", "pair_reject")
-            put("reason", p.reason)
-        }
-        Packet.Ping       -> put("type", "ping")
-        Packet.Pong       -> put("type", "pong")
-        Packet.Disconnect -> put("type", "disconnect")
     }
 }.toString()

@@ -12,8 +12,8 @@ import kotlinx.coroutines.launch
 import org.gcontinuity.android.network.DeviceInfo
 import org.gcontinuity.android.network.Packet
 import org.gcontinuity.android.pairing.PairingState
+import org.gcontinuity.android.plugins.BatteryState
 import org.gcontinuity.android.service.GContinuityService
-import org.gcontinuity.android.store.ALL_PLUGINS
 import org.gcontinuity.android.store.PluginStore
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -29,6 +29,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             MutableStateFlow(service.store.listTrustedDevices())
         } ?: MutableStateFlow(emptyList())
 
+    // ── Phase 3: Linux battery state ──────────────────────────────────────────
+
+    private val _linuxBatteryState = MutableStateFlow<BatteryState?>(null)
+    /**
+     * Linux machine's battery — received via [Packet.LinuxBatteryInfo] from the daemon.
+     * Null until the first packet arrives (≤ 60 s after connection).
+     * Observed by [org.gcontinuity.android.ui.screens.ConnectedScreen] to display
+     * Linux battery level below the "Connected" subtitle in the TopAppBar.
+     */
+    val linuxBatteryState: StateFlow<BatteryState?> = _linuxBatteryState.asStateFlow()
+
+    // ── Plugin settings ───────────────────────────────────────────────────────
+
     private val pluginStore = PluginStore(application)
 
     private val _pluginStates = MutableStateFlow(pluginStore.getAll())
@@ -39,19 +52,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _pluginStates.value = pluginStore.getAll()
     }
 
+    // ── Init — wait for service then collect all state flows ──────────────────
+
     init {
         viewModelScope.launch {
             while (true) {
                 val service = GContinuityService.instance
                 if (service != null) {
-                    launch { service.pairingState.collect { _pairingState.value = it } }
+                    launch { service.pairingState.collect      { _pairingState.value      = it } }
                     launch { service.discoveredDevices.collect { _discoveredDevices.value = it } }
+                    // Phase 3: collect Linux battery from daemon
+                    launch { service.linuxBatteryState.collect { _linuxBatteryState.value = it } }
                     break
                 }
                 delay(200)
             }
         }
     }
+
+    // ── Actions ───────────────────────────────────────────────────────────────
 
     fun unpairDevice(device: DeviceInfo) {
         GContinuityService.instance?.store?.removeTrustedDevice(device.deviceId)
@@ -85,7 +104,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendPing() {
-        // FIX: Packet.Ping is a bare object — no timestamp_ms argument.
         GContinuityService.instance?.wsClient?.send(Packet.Ping)
     }
 

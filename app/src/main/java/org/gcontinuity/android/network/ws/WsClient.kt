@@ -1,16 +1,10 @@
 // org/gcontinuity/android/network/ws/WsClient.kt
 //
-// CHANGES FROM OLD VERSION:
-//   1. `sendHello()` previously sent `Packet.Hello(..., fingerprint = ...)`.
-//      Hello no longer carries fingerprint — removed.
-//   2. Added `sendPairRequest()` called immediately after `sendHello()`.
-//      This is the NEW pairing flow:
-//        a) Android sends Hello {device_id, name, version}
-//        b) Linux replies Hello {device_id, name, version}
-//        c) Android sends PairRequest {device_id, name, fingerprint}
-//        d) Linux replies PairAccept or PairReject
-//   3. Removed `Packet.Disconnect(reason)` — Disconnect is now bare.
-//      `disconnect()` sends `Packet.Disconnect` (no argument).
+// CHANGE vs previous version:
+//   - Added sendRaw(json: String): Boolean — sends a raw JSON string over the
+//     WebSocket without going through network.Packet serialization.
+//     Used by BatteryPlugin to send transport.model.Packet.BatteryInfo JSON
+//     over the Phase 1 socket (the only socket that reliably connects).
 
 package org.gcontinuity.android.network.ws
 
@@ -26,15 +20,6 @@ import org.gcontinuity.android.network.toJson
 import org.gcontinuity.android.store.DeviceStore
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Phase 1 WebSocket client — manages the raw OkHttp WebSocket connection
- * and the pairing-layer packet exchange.
- *
- * Connection flow:
- * 1. [connect] → TLS handshake → [onOpen] → [sendHello] + [sendPairRequest]
- * 2. Remote sends packets → [onPacketReceived] → [PairingManager.handlePacket]
- * 3. [disconnect] → sends bare Disconnect packet → closes socket
- */
 class WsClient(
     private val scope: CoroutineScope,
     private val store: DeviceStore,
@@ -73,9 +58,6 @@ class WsClient(
             TlsHelper.buildOkHttpClient(trustedFingerprints)
         }
 
-        // No path suffix — tokio_tungstenite accepts any HTTP Upgrade path.
-        // FIX: IPv6 addresses must be wrapped in [] in URLs (RFC 2732).
-        // Without this, "wss://40e2:2020:...:52000" is parsed as invalid port.
         val hostPart = if (host.contains(':') && !host.startsWith('[')) "[$host]" else host
         val request = Request.Builder().url("wss://$hostPart:$port").build()
 
@@ -91,10 +73,7 @@ class WsClient(
                 }
 
                 onConnected()
-
-                // Step 1: send bare Hello (no fingerprint).
                 sendHello()
-                // Step 2: send PairRequest with fingerprint so Linux can verify.
                 sendPairRequest()
             }
 
@@ -119,9 +98,10 @@ class WsClient(
         }
 
         webSocket = okHttpClient.newWebSocket(request, listener)
-        return true // async — success is signalled by onOpen
+        return true
     }
 
+    /** Send a [network.Packet] over the WebSocket. */
     fun send(packet: Packet): Boolean {
         if (!_isConnected.get() || webSocket == null) return false
         val json = packet.toJson()
@@ -130,9 +110,22 @@ class WsClient(
     }
 
     /**
-     * Sends `{"type":"hello","device_id":...,"name":...,"version":1}`.
-     * No fingerprint — fingerprint is sent in the follow-up [sendPairRequest].
+     * Send a raw JSON string over the WebSocket without going through
+     * [network.Packet] serialization.
+     *
+     * Used by [org.gcontinuity.android.plugins.BatteryPlugin] to send
+     * [org.gcontinuity.android.transport.model.Packet.BatteryInfo] JSON
+     * over the Phase 1 socket — the only socket that reliably connects
+     * to the Linux daemon.
+     *
+     * No-ops silently if not connected.
      */
+    fun sendRaw(json: String): Boolean {
+        if (!_isConnected.get() || webSocket == null) return false
+        Log.d(TAG, "Sending raw: $json")
+        return webSocket!!.send(json)
+    }
+
     private fun sendHello() {
         send(
             Packet.Hello(
@@ -143,10 +136,6 @@ class WsClient(
         )
     }
 
-    /**
-     * Sends `{"type":"pair_request","device_id":...,"name":...,"fingerprint":...}`.
-     * Called immediately after [sendHello] so Linux receives both in sequence.
-     */
     private fun sendPairRequest() {
         send(
             Packet.PairRequest(
@@ -157,13 +146,8 @@ class WsClient(
         )
     }
 
-    /**
-     * Sends a bare `{"type":"disconnect"}` packet, then closes the socket
-     * with a normal close code (1000).
-     */
     fun disconnect(reason: String = "user_requested") {
         Log.i(TAG, "Disconnecting: $reason")
-        // Disconnect is bare — no reason field on the wire.
         send(Packet.Disconnect)
         webSocket?.close(1000, reason)
         _isConnected.set(false)
