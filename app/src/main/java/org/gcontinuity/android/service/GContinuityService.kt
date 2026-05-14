@@ -10,8 +10,6 @@ import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.gcontinuity.android.identity.DeviceIdentity
@@ -30,7 +28,6 @@ import org.gcontinuity.android.plugins.BatteryState
 import org.gcontinuity.android.plugins.PluginManager
 import org.gcontinuity.android.store.DeviceStore
 import org.gcontinuity.android.transport.TransportManager
-import org.gcontinuity.android.transport.model.ConnectionState
 import org.gcontinuity.android.transport.tls.hexColonToByteArray
 import javax.inject.Inject
 
@@ -101,19 +98,27 @@ class GContinuityService : LifecycleService() {
             store            = store,
             identity         = identity,
             onPacketReceived = { packet ->
-                // Intercept Phase 3–6 feature packets before PairingManager.
                 if (packet is NetworkPacket.FeaturePacket) {
                     pluginManager.dispatchRawFeaturePacket(packet.raw)
                 } else {
                     pairingManager.handlePacket(packet)
                 }
             },
-            onConnected    = { notificationHelper.postUpdate(this, stateToText(pairingState.value)) },
+            onConnected    = {
+                notificationHelper.postUpdate(
+                    this,
+                    stateToText(pairingState.value),
+                    deviceName = connectedDeviceName(),
+                )
+            },
             onDisconnected = {
                 val device = lastConnectedDevice
                 if (device != null) {
                     pairingState.value = PairingState.Reconnecting(device)
-                    notificationHelper.postUpdate(this, "Reconnecting…")
+                    notificationHelper.postUpdate(
+                        this, "Reconnecting…",
+                        deviceName = device.name,
+                    )
                 } else {
                     pairingState.value = PairingState.Scanning
                     notificationHelper.postUpdate(this, "Scanning…")
@@ -121,10 +126,8 @@ class GContinuityService : LifecycleService() {
             },
         )
 
-        // KEY FIX: wire WsClient.sendRaw into PluginManager so BatteryPlugin
-        // sends battery packets over the Phase 1 socket (not TransportManager).
-        // Must be called immediately after wsClient is constructed and BEFORE
-        // pluginManager.start() so the sender is ready when the first poll fires.
+        // Wire WsClient.sendRaw → BatteryPlugin so battery packets go over
+        // the Phase 1 socket (the only socket that reliably connects).
         pluginManager.setWsClientSender { json -> wsClient.sendRaw(json) }
 
         pairingManager = PairingManager(
@@ -134,11 +137,14 @@ class GContinuityService : LifecycleService() {
             onStateChange = { state ->
                 if (state is PairingState.PairedConnected) {
                     lastConnectedDevice = state.device
-                    // Send Android battery immediately on pairing complete.
                     pluginManager.sendBatteryNow()
                 }
                 pairingState.value = state
-                notificationHelper.postUpdate(this, stateToText(state))
+                notificationHelper.postUpdate(
+                    this,
+                    stateToText(state),
+                    deviceName = connectedDeviceName(state),
+                )
             },
         )
 
@@ -202,20 +208,8 @@ class GContinuityService : LifecycleService() {
             }
         }
 
-        transportManager.connectionState
-            .onEach { state ->
-                val text = when (state) {
-                    ConnectionState.CONNECTED    ->
-                        "Connected to ${transportManager.connectedDeviceName.value ?: "Linux"}"
-                    ConnectionState.RECONNECTING -> "Reconnecting…"
-                    ConnectionState.CONNECTING   -> "Connecting…"
-                    ConnectionState.DISCONNECTED -> stateToText(pairingState.value)
-                }
-                notificationHelper.postUpdate(this, text)
-            }
-            .launchIn(lifecycleScope)
 
-        // start() after setWsClientSender so sender is ready when first poll fires
+        // start() after setWsClientSender so sender is ready on first poll
         pluginManager.start(lifecycleScope)
 
         Log.i(TAG, "Service initialized. Device ID: ${identity.deviceId}")
@@ -267,13 +261,27 @@ class GContinuityService : LifecycleService() {
 
     override fun onBind(intent: Intent): IBinder? = super.onBind(intent)
 
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the connected device name for the notification title.
+     * Non-null when connected or reconnecting — triggers quick-action buttons.
+     * Null when scanning/idle — notification shows "GContinuity" as title.
+     */
+    private fun connectedDeviceName(state: PairingState = pairingState.value): String? =
+        when (state) {
+            is PairingState.PairedConnected -> state.device.name
+            is PairingState.Reconnecting    -> state.device.name
+            else                            -> null
+        }
+
     private fun stateToText(state: PairingState): String = when (state) {
-        is PairingState.PairedConnected -> "Connected to ${state.device.name}"
+        is PairingState.PairedConnected -> "Connected"
         is PairingState.AwaitingPair    -> "Pairing with ${state.device.name}…"
-        is PairingState.Reconnecting    -> "Reconnecting to ${state.device.name}…"
+        is PairingState.Reconnecting    -> "Reconnecting…"
         is PairingState.Scanning        -> "Scanning…"
         is PairingState.Error           -> "Error: ${state.message}"
-        else                            -> "Idle"
+        else                            -> "No device connected"
     }
 
     private fun acquireWakeLock() {

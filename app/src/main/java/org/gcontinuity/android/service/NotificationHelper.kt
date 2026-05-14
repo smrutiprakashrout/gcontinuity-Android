@@ -20,25 +20,38 @@ private const val CHANNEL_ID   = "gcontinuity_transport"
 private const val CHANNEL_NAME = "GContinuity Connection"
 
 /**
- * Singleton helper for building and posting the persistent foreground-service notification.
+ * Builds and posts the persistent foreground-service notification.
  *
- * Extracted from [GContinuityService] to be injectable and testable in isolation.
- * Handles the [NotificationChannel] creation (required API 26+) and the runtime
- * POST_NOTIFICATIONS permission check (required API 33+).
+ * ## When connected ([deviceName] non-null):
+ *   Title : device name  e.g. "SM-G990B2"
+ *   Body  : "Connected"
+ *   Actions: [Send Clipboard] [Send File] [Run Command]
+ *
+ * ## When not connected ([deviceName] null):
+ *   Title : "GContinuity"
+ *   Body  : "Scanning…" / "No device connected"
+ *   Actions: (none)
+ *
+ * ## Permission note
+ * POST_NOTIFICATIONS is a runtime permission on Android 13+.
+ * [MainActivity] requests it in onCreate before any notification is posted.
+ * [postUpdate] silently skips if the permission is not yet granted.
+ * The initial [startForeground] call in [GContinuityService] is always shown
+ * regardless — it is system-managed, not app-managed.
  */
 @Singleton
 class NotificationHelper @Inject constructor() {
 
     companion object {
-        const val NOTIFICATION_ID    = 1001
-        const val ACTION_DISCONNECT  = "org.gcontinuity.ACTION_DISCONNECT"
+        const val NOTIFICATION_ID       = 1001
+
+        // Quick-action intent actions — received by MainActivity
+        const val ACTION_OPEN_CLIPBOARD = "org.gcontinuity.OPEN_CLIPBOARD"
+        const val ACTION_OPEN_FILES     = "org.gcontinuity.OPEN_FILES"
+        const val ACTION_OPEN_COMMANDS  = "org.gcontinuity.OPEN_COMMANDS"
+        const val EXTRA_NAV_ACTION      = "nav_action"
     }
 
-    /**
-     * Creates the [NotificationChannel] if it has not been created yet.
-     * Safe to call multiple times — the system is idempotent for existing channels.
-     * Must be called before [buildNotification] is used as a foreground notification.
-     */
     fun createChannel(context: Context) {
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -56,12 +69,18 @@ class NotificationHelper @Inject constructor() {
     }
 
     /**
-     * Builds the persistent foreground notification with [statusText] as the body.
+     * Builds the persistent foreground notification.
      *
-     * Includes a tap-to-open action (launches [MainActivity]) and a "Disconnect"
-     * action that sends [ACTION_DISCONNECT] to [GContinuityService].
+     * @param statusText  Body text shown under the title.
+     * @param deviceName  Connected device name, or null when not connected.
+     *                    When non-null, shown as title and quick-action buttons appear.
      */
-    fun buildNotification(context: Context, statusText: String): Notification {
+    fun buildNotification(
+        context: Context,
+        statusText: String,
+        deviceName: String? = null,
+    ): Notification {
+        // Tap notification body → open app
         val openIntent = PendingIntent.getActivity(
             context, 0,
             Intent(context, MainActivity::class.java).apply {
@@ -69,15 +88,9 @@ class NotificationHelper @Inject constructor() {
             },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val disconnectIntent = PendingIntent.getService(
-            context, 1,
-            Intent(context, GContinuityService::class.java).apply {
-                action = ACTION_DISCONNECT
-            },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return NotificationCompat.Builder(context, CHANNEL_ID)
-            .setContentTitle("GContinuity")
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setContentTitle(deviceName ?: "GContinuity")
             .setContentText(statusText)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(openIntent)
@@ -85,19 +98,37 @@ class NotificationHelper @Inject constructor() {
             .setSilent(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(0, "Disconnect", disconnectIntent)
-            .build()
+
+        // Quick-action buttons — only shown when a device is connected
+        if (deviceName != null) {
+            builder.addAction(
+                0, "Send Clipboard",
+                quickActionIntent(context, ACTION_OPEN_CLIPBOARD, requestCode = 2),
+            )
+            builder.addAction(
+                0, "Send File",
+                quickActionIntent(context, ACTION_OPEN_FILES, requestCode = 3),
+            )
+            builder.addAction(
+                0, "Run Command",
+                quickActionIntent(context, ACTION_OPEN_COMMANDS, requestCode = 4),
+            )
+        }
+
+        return builder.build()
     }
 
     /**
-     * Posts the notification with the given [statusText].
+     * Posts an updated notification.
      *
-     * On API 33+ checks POST_NOTIFICATIONS permission before posting; silently
-     * skips if the permission has not been granted (the foreground notification
-     * posted via [startForeground] is always shown regardless of this permission,
-     * but updates to it require the grant on API 33+).
+     * @param statusText  Body text.
+     * @param deviceName  Connected device name, or null when not connected.
      */
-    fun postUpdate(context: Context, statusText: String) {
+    fun postUpdate(
+        context: Context,
+        statusText: String,
+        deviceName: String? = null,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
                 context, Manifest.permission.POST_NOTIFICATIONS
@@ -105,6 +136,28 @@ class NotificationHelper @Inject constructor() {
             if (!granted) return
         }
         context.getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification(context, statusText))
+            .notify(NOTIFICATION_ID, buildNotification(context, statusText, deviceName))
     }
+
+    // ── Private ───────────────────────────────────────────────────────────────
+
+    /**
+     * Builds a [PendingIntent] that opens [MainActivity] with the given [action].
+     * Uses FLAG_ACTIVITY_SINGLE_TOP so if the app is already in foreground,
+     * [MainActivity.onNewIntent] is called instead of recreating the activity.
+     */
+    private fun quickActionIntent(
+        context: Context,
+        action: String,
+        requestCode: Int,
+    ): PendingIntent = PendingIntent.getActivity(
+        context,
+        requestCode,
+        Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            this.action = action
+            putExtra(EXTRA_NAV_ACTION, action)
+        },
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 }
