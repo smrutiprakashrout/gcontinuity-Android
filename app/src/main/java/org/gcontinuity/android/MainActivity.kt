@@ -16,6 +16,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -33,16 +34,15 @@ import org.gcontinuity.android.viewmodel.MainViewModel
 class MainActivity : ComponentActivity() {
 
     // ── POST_NOTIFICATIONS runtime permission (Android 13+) ───────────────────
-    // Must be requested before the notification is posted. The system grants it
-    // automatically on API < 33 — the launcher only runs on API 33+.
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* granted or denied — service continues either way */ }
+    ) { /* service continues regardless */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         requestNotificationPermission()
+        requestOverlayPermission()
         requestBatteryExemption()
 
         val initialState = GContinuityService.instance?.pairingState?.value
@@ -54,14 +54,13 @@ class MainActivity : ComponentActivity() {
                 val vm: MainViewModel = viewModel()
                 val pairingState by vm.pairingState.collectAsState()
 
-                // Handle quick-action intent that launched/resumed the activity
+                // Handle notification quick-action intent on launch
                 LaunchedEffect(Unit) {
-                    handleNavIntent(intent, navController)
+                    handleNavIntent(intent, navController, vm)
                 }
 
                 LaunchedEffect(pairingState) {
                     val current = navController.currentDestination?.route
-
                     when (pairingState) {
                         is PairingState.PairedConnected -> {
                             if (current != "connected" && current != "plugin_settings") {
@@ -149,22 +148,27 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Called when the activity is already running and a notification quick-action
-     * intent arrives (FLAG_ACTIVITY_SINGLE_TOP). Routes to the correct screen.
+     * Called when app is already running and a notification quick-action
+     * intent arrives (FLAG_ACTIVITY_SINGLE_TOP).
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // NavController is not accessible here directly — store intent and let
-        // the LaunchedEffect in setContent pick it up on next recomposition.
         setIntent(intent)
+        // The LaunchedEffect(Unit) won't re-trigger for onNewIntent.
+        // Handle clipboard send directly here when app is already open.
+        if (intent.action == NotificationHelper.ACTION_OPEN_CLIPBOARD) {
+            GContinuityService.instance?.let { service ->
+                // App is now in foreground — clipboard is readable.
+                service.pluginManager.sendClipboardNow()
+            }
+        }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Permission helpers ────────────────────────────────────────────────────
 
     /**
-     * Requests POST_NOTIFICATIONS permission on Android 13+.
-     * On earlier versions the permission is granted automatically.
-     * Called before the service posts any notification.
+     * Request POST_NOTIFICATIONS on Android 13+.
+     * Foreground service notification requires this on API 33+.
      */
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -172,9 +176,31 @@ class MainActivity : ComponentActivity() {
                 this, Manifest.permission.POST_NOTIFICATIONS
             ) == PackageManager.PERMISSION_GRANTED
             if (!granted) {
-                notificationPermissionLauncher.launch(
-                    Manifest.permission.POST_NOTIFICATIONS
-                )
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    /**
+     * Request SYSTEM_ALERT_WINDOW (Draw over other apps) for the clipboard overlay.
+     * This is a special permission — cannot use registerForActivityResult.
+     * Redirects user to the system settings page if not already granted.
+     * Only shown once; subsequent launches skip if already granted.
+     */
+    private fun requestOverlayPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!Settings.canDrawOverlays(this)) {
+                try {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                } catch (_: Exception) {
+                    // Settings page not available on this device — overlay will
+                    // fall back to heads-up notification silently.
+                }
             }
         }
     }
@@ -194,35 +220,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ── Navigation intent handler ─────────────────────────────────────────────
+
     /**
-     * Routes to the correct in-app screen based on the notification quick-action
-     * intent. Called from [LaunchedEffect] in setContent (on first launch) and
-     * after [onNewIntent] (when app is already running).
-     *
-     * This function is a no-op if the intent has no recognised action.
+     * Routes notification quick-action intents to the correct in-app screen.
+     * Called from [LaunchedEffect] on first launch.
+     * [onNewIntent] handles the case when app is already running.
      */
     private fun handleNavIntent(
         intent: Intent?,
-        navController: androidx.navigation.NavController,
+        navController: NavController,
+        vm: MainViewModel,
     ) {
         when (intent?.action) {
             NotificationHelper.ACTION_OPEN_CLIPBOARD -> {
+                // App just came to foreground — clipboard is now readable.
+                // Send clipboard immediately then navigate to connected screen.
+                GContinuityService.instance?.pluginManager?.sendClipboardNow()
                 navController.navigate("connected") {
                     popUpTo("scan") { inclusive = false }
                 }
-                // TODO: open clipboard sheet inside ConnectedScreen
             }
             NotificationHelper.ACTION_OPEN_FILES -> {
                 navController.navigate("connected") {
                     popUpTo("scan") { inclusive = false }
                 }
-                // TODO: open file picker inside ConnectedScreen
+                // TODO: open file picker inside ConnectedScreen (Phase 4)
             }
             NotificationHelper.ACTION_OPEN_COMMANDS -> {
                 navController.navigate("connected") {
                     popUpTo("scan") { inclusive = false }
                 }
-                // TODO: navigate to commands tab inside ConnectedScreen
+                // TODO: navigate to commands tab inside ConnectedScreen (Phase 5)
             }
         }
     }

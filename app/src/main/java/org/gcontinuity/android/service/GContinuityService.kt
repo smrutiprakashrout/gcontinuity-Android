@@ -126,8 +126,9 @@ class GContinuityService : LifecycleService() {
             },
         )
 
-        // Wire WsClient.sendRaw → BatteryPlugin so battery packets go over
-        // the Phase 1 socket (the only socket that reliably connects).
+        // Wire WsClient.sendRaw → BatteryPlugin + ClipboardPlugin.
+        // Must be called BEFORE pluginManager.start() so the sender is ready
+        // when the first battery poll and clipboard listener fire.
         pluginManager.setWsClientSender { json -> wsClient.sendRaw(json) }
 
         pairingManager = PairingManager(
@@ -208,8 +209,11 @@ class GContinuityService : LifecycleService() {
             }
         }
 
+        // NOTE: transportManager.connectionState is intentionally NOT observed.
+        // Phase 2 TransportManager cycles CONNECTING→RECONNECTING indefinitely
+        // which caused notification flickering. Status is driven by pairingState only.
 
-        // start() after setWsClientSender so sender is ready on first poll
+        // start() after setWsClientSender so both plugins have sender ready on first event
         pluginManager.start(lifecycleScope)
 
         Log.i(TAG, "Service initialized. Device ID: ${identity.deviceId}")
@@ -263,11 +267,6 @@ class GContinuityService : LifecycleService() {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /**
-     * Returns the connected device name for the notification title.
-     * Non-null when connected or reconnecting — triggers quick-action buttons.
-     * Null when scanning/idle — notification shows "GContinuity" as title.
-     */
     private fun connectedDeviceName(state: PairingState = pairingState.value): String? =
         when (state) {
             is PairingState.PairedConnected -> state.device.name

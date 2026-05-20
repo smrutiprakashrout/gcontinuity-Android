@@ -18,21 +18,31 @@ private const val TAG = "PluginManager"
 /**
  * Manages lifecycle and inbound packet routing for all [FeaturePlugin] instances.
  *
- * ## Sending Android battery to Linux
- * Battery packets are sent via WsClient (Phase 1 socket) not TransportManager.
+ * ## Registered plugins (Phase 3)
+ * - [BatteryPlugin]   — battery sync (Phase 3.1)
+ * - [ClipboardPlugin] — clipboard sync (Phase 3.2)
+ *
+ * ## Sending over Phase 1 socket
+ * Both [BatteryPlugin] and [ClipboardPlugin] send packets via [WsClient.sendRaw]
+ * (Phase 1 socket — the only socket that reliably connects to the daemon).
  * [GContinuityService] calls [setWsClientSender] after constructing WsClient,
- * which sets the raw-JSON sender lambda on [BatteryPlugin].
+ * which propagates the sender lambda to both plugins.
  *
  * ## Two inbound paths
  * - Path A: TransportManager → PacketHandler.featurePackets → plugins
  * - Path B: WsClient → GContinuityService → [dispatchRawFeaturePacket] → plugins
+ *
+ * ## Adding future plugins
+ * Add one constructor param + one line in [start]'s `all` list.
+ * [GContinuityService] never changes.
  */
 @Singleton
 class PluginManager @Inject constructor(
     private val pluginStore: PluginStore,
     private val packetHandler: PacketHandler,
-    private val batteryPlugin: BatteryPlugin,
-    // private val clipboardPlugin: ClipboardPlugin,
+    private val batteryPlugin:   BatteryPlugin,
+    private val clipboardPlugin: ClipboardPlugin,
+    // private val notificationsPlugin: NotificationsPlugin,  // Phase 4
 ) {
     private var enabledPlugins: List<FeaturePlugin> = emptyList()
     private var pluginScope: CoroutineScope? = null
@@ -52,15 +62,14 @@ class PluginManager @Inject constructor(
     // ── WsClient sender wiring ────────────────────────────────────────────────
 
     /**
-     * Called by [GContinuityService] after WsClient is constructed.
-     * Sets the raw-JSON send lambda on [BatteryPlugin] so it sends
-     * [Packet.BatteryInfo] over the Phase 1 socket instead of TransportManager.
-     *
-     * @param sender Lambda that calls [WsClient.sendRaw].
+     * Called by [GContinuityService] immediately after WsClient is constructed.
+     * Propagates the raw-JSON sender to every plugin that needs to send packets
+     * over the Phase 1 socket.
      */
     fun setWsClientSender(sender: (String) -> Unit) {
-        batteryPlugin.wsClientSender = sender
-        Log.d(TAG, "WsClient sender set on BatteryPlugin")
+        batteryPlugin.wsClientSender   = sender
+        clipboardPlugin.wsClientSender = sender
+        Log.d(TAG, "WsClient sender set on BatteryPlugin + ClipboardPlugin")
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -70,16 +79,30 @@ class PluginManager @Inject constructor(
 
         val all: List<FeaturePlugin> = listOf(
             batteryPlugin,
-            // clipboardPlugin,
+            clipboardPlugin,
+            // notificationsPlugin,
         )
 
-        enabledPlugins = all.filter { pluginStore.isEnabled(it.pluginId) }
+        // ClipboardPlugin uses two plugin IDs (send + receive) — check both.
+        // For all others, isEnabled(pluginId) is sufficient.
+        // ClipboardPlugin.start() internally checks both IDs itself, so we
+        // include it in enabledPlugins as long as either direction is on.
+        enabledPlugins = all.filter { plugin ->
+            when (plugin) {
+                is ClipboardPlugin ->
+                    pluginStore.isEnabled("clipboard_sync_send") ||
+                            pluginStore.isEnabled("clipboard_sync_receive")
+                else ->
+                    pluginStore.isEnabled(plugin.pluginId)
+            }
+        }
 
         enabledPlugins.forEach { plugin ->
             Log.i(TAG, "Starting plugin: ${plugin.pluginId}")
             plugin.start(scope)
         }
 
+        // Path A: TransportManager → PacketHandler.featurePackets → plugins.
         packetHandler.featurePackets
             .onEach { packet -> dispatchToPlugins(packet) }
             .launchIn(scope)
@@ -96,10 +119,19 @@ class PluginManager @Inject constructor(
         pluginScope = null
     }
 
-    // ── Immediate battery send on pairing complete ────────────────────────────
+    // ── Convenience methods ───────────────────────────────────────────────────
 
+    /** Trigger immediate Android battery send on pairing complete. */
     fun sendBatteryNow() {
         batteryPlugin.sendNow()
+    }
+
+    /**
+     * Called by [MainActivity] when the user taps "Send Clipboard" from the
+     * heads-up notification (Path B — app just came to foreground).
+     */
+    fun sendClipboardNow() {
+        clipboardPlugin.sendClipboardNow()
     }
 
     // ── Path B: WsClient raw JSON dispatch ────────────────────────────────────

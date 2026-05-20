@@ -1,35 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- ── Network ── -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
-    <!-- ── Foreground Service ── -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
-    <!-- ── Boot ── -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
-    <!-- ── Battery optimization ──
-         REQUEST_IGNORE_BATTERY_OPTIMIZATIONS lets us show the system dialog
-         asking the user to exclude this app — same as KDE Connect does.
-         WAKE_LOCK keeps the CPU alive when the screen is off. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- ── Notifications (Android 13+) ── -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- ── Media read (Phase 2: file transfer) ── -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
-    <!-- Fallback for API < 33 -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
@@ -53,23 +45,25 @@
             </intent-filter>
         </activity>
 
-        <!--
-            stopWithTask="false": service keeps running when the user swipes
-            the app away from recents. GContinuityService.onTaskRemoved()
-            handles an immediate self-restart for extra safety on OEMs that
-            ignore this flag (Samsung, Xiaomi, OnePlus).
-        -->
+        <activity
+            android:name=".SendTextActivity"
+            android:label="Send to Linux"
+            android:theme="@style/Theme.Transparent"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".service.GContinuityService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice"
             android:stopWithTask="false" />
 
-        <!--
-            exported="true" is required — the system needs to deliver boot
-            broadcasts to this receiver.
-            enabled="true" ensures the receiver is active from first install.
-        -->
         <receiver
             android:name=".service.BootReceiver"
             android:enabled="true"
@@ -78,7 +72,6 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-                <!-- Fires before credential storage unlocks on direct-boot devices -->
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
