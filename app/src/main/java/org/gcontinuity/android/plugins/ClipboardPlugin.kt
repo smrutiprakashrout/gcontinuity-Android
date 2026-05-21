@@ -105,6 +105,19 @@ class ClipboardPlugin @Inject constructor(
         trySend(text)
     }
 
+    /** Phase 3.3 — Called by SendTextActivity when a URL is shared */
+    fun sendUrl(url: String) {
+        val sender = wsClientSender ?: run {
+            Log.w(TAG, "wsClientSender not set — cannot send URL")
+            return
+        }
+
+        val packet = Packet.OpenUrl(url = url)
+        val encoded = json.encodeToString(Packet.serializer(), packet)
+        sender(encoded)
+        Log.d(TAG, "TX OpenUrl: Sent URL to Linux: $url")
+    }
+
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
         if (!pluginStore.isEnabled("clipboard_sync_send")) return@OnPrimaryClipChangedListener
 

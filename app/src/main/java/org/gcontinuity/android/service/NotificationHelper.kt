@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import org.gcontinuity.android.MainActivity
 import org.gcontinuity.android.R
+import org.gcontinuity.android.SendTextActivity
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -23,14 +24,14 @@ private const val CHANNEL_NAME = "GContinuity Connection"
  * Builds and posts the persistent foreground-service notification.
  *
  * ## When connected ([deviceName] non-null):
- *   Title : device name  e.g. "SM-G990B2"
- *   Body  : "Connected"
- *   Actions: [Send Clipboard] [Send File] [Run Command]
+ * Title : device name  e.g. "SM-G990B2"
+ * Body  : "Connected"
+ * Actions: [Send Clipboard] [Send File] [Run Command]
  *
  * ## When not connected ([deviceName] null):
- *   Title : "GContinuity"
- *   Body  : "Scanning…" / "No device connected"
- *   Actions: (none)
+ * Title : "GContinuity"
+ * Body  : "Scanning…" / "No device connected"
+ * Actions: (none)
  *
  * ## Permission note
  * POST_NOTIFICATIONS is a runtime permission on Android 13+.
@@ -73,7 +74,7 @@ class NotificationHelper @Inject constructor() {
      *
      * @param statusText  Body text shown under the title.
      * @param deviceName  Connected device name, or null when not connected.
-     *                    When non-null, shown as title and quick-action buttons appear.
+     * When non-null, shown as title and quick-action buttons appear.
      */
     fun buildNotification(
         context: Context,
@@ -101,10 +102,21 @@ class NotificationHelper @Inject constructor() {
 
         // Quick-action buttons — only shown when a device is connected
         if (deviceName != null) {
+
+            // 👉 Phase 3.2 FIX: Route to the invisible ghost Activity to bypass Android 10 clipboard restrictions
             builder.addAction(
                 0, "Send Clipboard",
-                quickActionIntent(context, ACTION_OPEN_CLIPBOARD, requestCode = 2),
+                PendingIntent.getActivity(
+                    context,
+                    2,
+                    Intent(context, SendTextActivity::class.java).apply {
+                        action = "org.gcontinuity.ACTION_MANUAL_SEND_CLIPBOARD"
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION
+                    },
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                )
             )
+
             builder.addAction(
                 0, "Send File",
                 quickActionIntent(context, ACTION_OPEN_FILES, requestCode = 3),

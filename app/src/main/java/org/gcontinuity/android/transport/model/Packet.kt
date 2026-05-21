@@ -38,11 +38,19 @@ sealed class Packet {
     @SerialName("session_resume")
     data class SessionResume(val session_token: String) : Packet()
 
-    // ── Phase 3: Data Sync ────────────────────────────────────────────────────
+    // ── Phase 3: Data Sync & URL Handoff ──────────────────────────────────────
 
     @Serializable
     @SerialName("clipboard_sync")
     data class ClipboardSync(val mime: String, val data: String) : Packet()
+
+    /**
+     * Phase 3.3 — URL Handoff
+     * Instructs the receiving device to open the provided URL in its default browser.
+     */
+    @Serializable
+    @SerialName("open_url")
+    data class OpenUrl(val url: String) : Packet()
 
     /**
      * Android → Linux: Android battery status.

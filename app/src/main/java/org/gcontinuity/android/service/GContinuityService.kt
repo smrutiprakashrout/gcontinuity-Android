@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
+import android.widget.Toast
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
@@ -70,6 +71,7 @@ class GContinuityService : LifecycleService() {
         const val ACTION_DISCONNECT     = "org.gcontinuity.ACTION_DISCONNECT"
         const val ACTION_ACCEPT_PAIRING = "org.gcontinuity.ACCEPT_PAIRING"
         const val ACTION_REJECT_PAIRING = "org.gcontinuity.REJECT_PAIRING"
+        const val ACTION_SEND_CLIPBOARD = "org.gcontinuity.ACTION_SEND_CLIPBOARD" // <--- NEW
 
         var instance: GContinuityService? = null
             private set
@@ -126,9 +128,6 @@ class GContinuityService : LifecycleService() {
             },
         )
 
-        // Wire WsClient.sendRaw → BatteryPlugin + ClipboardPlugin.
-        // Must be called BEFORE pluginManager.start() so the sender is ready
-        // when the first battery poll and clipboard listener fire.
         pluginManager.setWsClientSender { json -> wsClient.sendRaw(json) }
 
         pairingManager = PairingManager(
@@ -209,11 +208,6 @@ class GContinuityService : LifecycleService() {
             }
         }
 
-        // NOTE: transportManager.connectionState is intentionally NOT observed.
-        // Phase 2 TransportManager cycles CONNECTING→RECONNECTING indefinitely
-        // which caused notification flickering. Status is driven by pairingState only.
-
-        // start() after setWsClientSender so both plugins have sender ready on first event
         pluginManager.start(lifecycleScope)
 
         Log.i(TAG, "Service initialized. Device ID: ${identity.deviceId}")
@@ -234,6 +228,13 @@ class GContinuityService : LifecycleService() {
                 }
             }
             ACTION_REJECT_PAIRING -> pairingManager.rejectPairing()
+
+            // Phase 3.2: Manually push the clipboard in the background without opening the app
+            ACTION_SEND_CLIPBOARD -> {
+                pluginManager.sendClipboardNow()
+                Toast.makeText(this, "Clipboard sent to Linux", Toast.LENGTH_SHORT).show()
+                Log.d(TAG, "Manual clipboard send triggered via Notification")
+            }
         }
         return START_STICKY
     }
